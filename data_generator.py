@@ -34,8 +34,8 @@ theta_upper_tau   = 2.4
 theta_lower_eo    = 0.2
 theta_upper_eo    = 0.55
 
-batch_size = 50
-
+batch_size = 100
+tr_sec = .72
 rng = np.random.default_rng(seed= int(args.seed))
 
 # sample each parameter independently from uniform distributions
@@ -43,7 +43,11 @@ alpha_inputs = rng.uniform(theta_lower_alpha, theta_upper_alpha, batch_size)
 tau_inputs   = rng.uniform(theta_lower_tau,   theta_upper_tau,   batch_size)
 eo_inputs    = rng.uniform(theta_lower_eo,    theta_upper_eo,    batch_size)
 
+sigma_ou_low,  sigma_ou_high  = 0.005, 0.05
+exc_ext_low,   exc_ext_high   = 0.5,   1.5
 
+sigma_ou_inputs = rng.uniform(sigma_ou_low,  sigma_ou_high,  batch_size)
+exc_ext_inputs  = rng.uniform(exc_ext_low,   exc_ext_high,   batch_size)
 print("batches were set up!")
 
 # stack into (batch_size, 3) tensor for SBI — [alpha, tau, Eo]
@@ -57,24 +61,24 @@ print("torch conversion done of theta inputs!")
 outputs_exc  = []
 outputs_bold = []
 
-# stack into (batch_size, 3) tensor for SBI — [alpha, tau, Eo]
-raw_theta_tensor = torch.tensor(
-    np.stack([alpha_inputs, tau_inputs, eo_inputs], axis=1),
-    dtype=torch.float32
-)
+bold_noise_variance = 0.00048
+bold_noise = rng.normal(0,  bold_noise_variance,  batch_size)
 
 
 for i in range(batch_size):
     model = WCModel()
-    model.params['duration'] = 15 * 600000
-    model.params['sigma_ou'] = 0.1
+    model.params['duration'] = 18 * 60000
+    model.params['sigma_ou'] = sigma_ou_inputs[i]
+    model.params['exc_ext']  = exc_ext_inputs[i]
     model.run()
+    
+    
 
     exc = model.outputs['exc'][0]
 
-    nn           = 1
+    nn_val           = 1
     dtt          = model.params['dt'] / 1000.0
-    steps_per_tr = max(1, int(round(2000.0 / model.params['dt'])))
+    steps_per_tr = max(1, int(round(tr_sec * 1000.0 / model.params['dt'])))
 
     P = ParBold(
         alpha = alpha_inputs[i],
@@ -82,13 +86,13 @@ for i in range(batch_size):
         Eo    = eo_inputs[i],
     )
 
-    s      = np.ones((2, nn))
-    f      = np.ones((2, nn))
-    ftilde = np.zeros((2, nn))
-    vtilde = np.zeros((2, nn))
-    qtilde = np.zeros((2, nn))
-    v      = np.ones((2, nn))
-    q      = np.ones((2, nn))
+    s      = np.ones((2, nn_val))
+    f      = np.ones((2, nn_val))
+    ftilde = np.zeros((2, nn_val))
+    vtilde = np.zeros((2, nn_val))
+    qtilde = np.zeros((2, nn_val))
+    v      = np.ones((2, nn_val))
+    q      = np.ones((2, nn_val))
 
     bold_out = []
     for j, x in enumerate(exc):
@@ -99,15 +103,16 @@ for i in range(batch_size):
             + (P.epsilon * P.r0 * P.Eo * P.TE) * (1.0 - q[0, 0] / v[0, 0])
             + (1.0 - P.epsilon)  * (1.0 - v[0, 0])
             )
+            bold_val+= np.abs(bold_noise[i])
             bold_out.append(bold_val)
 
     bold = np.array(bold_out)
 
-    cutoff_exc  = len(exc)  // 2
-    cutoff_bold = len(bold) // 2
-    
+    #cutoff_exc  = len(exc)  // 2
+    cutoff_bold = int(round(15 * 60.0 / tr_sec))
+   
     outputs_bold.append(bold[-cutoff_bold:])
-    outputs_exc.append(exc[-cutoff_exc:])
+    #outputs_exc.append(exc[-cutoff_exc:])
     
     
     print("simulation", i, "done")
