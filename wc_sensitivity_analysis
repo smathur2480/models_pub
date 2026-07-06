@@ -1,0 +1,578 @@
+"""
+wc_sensitivity_analysis.py
+───────────────────────
+Sensitivity analysis of the neurolib WCModel excitatory output only.
+No BOLD, no SBI posterior, no hemodynamic model.
+
+Three methods:
+  1. One-At-A-Time (OAT) scan
+     Vary each WC parameter independently across its prior range.
+     Measures coefficient of variation (CV) of output statistics.
+     Total simulations: N_GRID × n_params = 12 × 10 = 120
+
+  2. Sobol variance-based global sensitivity (SALib)
+     Saltelli sampling captures parameter interactions.
+     Total simulations: N_SOBOL × (2 × n_params + 2) = 128 × 22 = 2,816
+     Reports S1 (first-order) and ST (total-order) per output statistic.
+
+  3. Posterior-free active subspace approximation
+     No SBI posterior needed. Builds a Gaussian process surrogate over
+     (parameter, exc_std) pairs from the Sobol sample set, then estimates
+     the active subspace directions from the GP's gradient covariance.
+     This gives eigenvectors/eigenvalues and activity scores without
+     training a neural posterior or running additional simulations.
+
+Output statistics (from exc timeseries only):
+  exc_mean       — mean firing level (operating point)
+  exc_std        — temporal variability (oscillation amplitude)
+  exc_psd_slope  — 1/f exponent of exc power spectrum
+
+Parameter prior ranges and their explicit sources
+──────────────────────────────────────────────────
+neurolib name       prior range    source
+────────────────────────────────────────────────────────────────────────
+c_excexc  [W_EE]   [10, 24]      neurolib default=16 (loadDefaultParams.py);
+                                   prompt table W_EE=16; upper bound from
+                                   bifurcation scan: network saturates above 23
+
+c_excinh  [W_EI]   [10, 30]      neurolib default=15; prompt table W_EI=26;
+                                   Neuromatch WC tutorial (compneuro.neuromatch.io
+                                   W2D4_Tutorial2) uses wEI=4.8-6.4 normalized
+                                   ≈15-30 in neurolib unnormalized units
+
+c_inhexc  [W_IE]   [8, 28]       neurolib default=12; prompt table W_IE=20;
+                                   Rosetta Stone of Neural Mass Models
+                                   (arXiv:2512.10982) uses kappa_xy=12
+
+c_inhinh  [W_II]   [1, 8]        neurolib default=3; prompt table W_II=1;
+                                   range covers both values
+
+tau_exc   [τ_E]    [1, 10] ms    neurolib default=2.5ms; AMPA synaptic
+                                   time constants 2-5ms (Destexhe et al. 1998
+                                   J.Comput.Neurosci.5:363-387);
+                                   Vattikonda et al. (arXiv:2506.22951) use
+                                   τ_e=10ms; prompt table τ_E=20ms is in
+                                   different (normalized) units
+
+tau_inh   [τ_I]    [2, 20] ms    neurolib default=3.75ms; GABA-A 5-20ms
+                                   (Destexhe et al. 1998);
+                                   Vattikonda et al. use τ_i=20ms;
+                                   prompt table τ_I=10ms (normalized units)
+
+a_exc     [m_E]    [0.5, 3.0]    neurolib default=1.5; prompt table m_E=1;
+                                   NO literature range found for neurolib's
+                                   specific sigmoid parameterization —
+                                   range is ±50% bracket around default
+
+mu_exc    [θ_E]    [0.0, 5.0]    neurolib default=3.0; prompt table θ_E=5;
+                                   range spans from zero threshold to the
+                                   prompt table value
+
+sigma_ou  [noise]  [0.005, 0.3]  NOT in classical WC (no noise term);
+                                   Cakan et al. 2021 (Cognitive Computation
+                                   15:1132) use sigma_ou=0.14 for HCP fitting
+                                   with neurolib WCModel; range brackets 0.14
+
+exc_ext_baseline    [0.0, 2.0]   neurolib default=0; prompt table i_E=2;
+                                   Papadopoulos et al. (arXiv:2002.00094)
+                                   sweep P_E across [0,2] in Wilson-Cowan
+                                   to induce sub/supra-critical transitions
+
+Install requirements:
+    pip install SALib scikit-learn
+"""
+
+import numpy as np
+import torch
+import scipy.signal
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
+import multiprocessing
+import os
+
+from neurolib.models.wc import WCModel
+
+try:
+    from SALib.sample import saltelli
+    from SALib.analyze import sobol as sobol_analyze
+    SALIB_AVAILABLE = True
+except ImportError:
+    print("SALib not installed — Sobol indices skipped. pip install SALib")
+    SALIB_AVAILABLE = False
+
+try:
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+    from sklearn.preprocessing import StandardScaler
+    GP_AVAILABLE = True
+except ImportError:
+    print("scikit-learn not installed — GP active subspace skipped.")
+    GP_AVAILABLE = False
+
+# ── simulation settings ───────────────────────────────────────────────────────
+DURATION_MS  = 6 * 60 * 1000      # 6 minutes
+TRANSIENT_MS = 2 * 60 * 1000      # discard first 2 min
+DT_MS        = 0.1                 # neurolib default
+N_GRID       = 12                  # OAT grid points per parameter
+N_SOBOL      = 128                 # Sobol base sample (total = N × (2p+2))
+PLOT_PATH    = "wc_sensitivity_results.png"
+
+# ── parameter table ───────────────────────────────────────────────────────────
+# (neurolib_name, default, low, high, description)
+#
+# Previously missing parameters from loadDefaultParams.py now added:
+#
+# a_inh [m_I]:  prior [0.5, 3.0]
+#   neurolib default=1.5; prompt table m_I=1. Symmetric to a_exc.
+#   No literature range found for neurolib parameterization — ±50% bracket.
+#
+# mu_inh [θ_I]:  prior [0.0, 25.0]
+#   neurolib default=3.0; prompt table θ_I=20 (different normalization).
+#   Range [0, 25] spans both the neurolib default and prompt table value.
+#
+# inh_ext_baseline [i_I]:  prior [0.0, 7.0]
+#   neurolib default=0; prompt table i_I=7. No sweep found in literature
+#   for this specific parameter in neurolib WCModel — upper bound = table value.
+#
+# inh_ext [time-dep input to I]:  prior [0.0, 7.0]
+#   neurolib default=0. Treated as constant drive here (same range as baseline).
+#   No literature range found — mirrors inh_ext_baseline.
+#
+# tau_ou [OU timescale]:  prior [1.0, 20.0] ms
+#   neurolib default=5.0ms. Not in prompt table (no noise in classical WC).
+#   Range [1, 20] ms spans fast (near-white) to slow (correlated) noise.
+#   No specific literature range found — empirically motivated bracket.
+
+PARAMS = [
+    # coupling weights
+    ("c_excexc",          16.0,  10.0,  24.0,  "W_EE (E→E coupling)"),
+    ("c_excinh",          15.0,  10.0,  30.0,  "W_EI (E→I coupling)"),
+    ("c_inhexc",          12.0,   8.0,  28.0,  "W_IE (I→E coupling)"),
+    ("c_inhinh",           3.0,   1.0,   8.0,  "W_II (I→I coupling)"),
+    # time constants
+    ("tau_exc",            2.5,   1.0,  10.0,  "τ_E exc time const (ms)"),
+    ("tau_inh",            3.75,  2.0,  20.0,  "τ_I inh time const (ms)"),
+    # sigmoid parameters
+    ("a_exc",              1.5,   0.5,   3.0,  "m_E exc sigmoid gain"),
+    ("a_inh",              1.5,   0.5,   3.0,  "m_I inh sigmoid gain"),
+    ("mu_exc",             3.0,   0.0,   5.0,  "θ_E exc threshold"),
+    ("mu_inh",             3.0,   0.0,  25.0,  "θ_I inh threshold"),
+    # noise
+    ("sigma_ou",           0.0,   0.005, 0.3,  "OU noise amplitude σ"),
+    ("tau_ou",             5.0,   1.0,  20.0,  "OU noise timescale (ms)"),
+    # external inputs
+    ("exc_ext_baseline",   0.0,   0.0,   2.0,  "i_E baseline input to E"),
+    ("inh_ext_baseline",   0.0,   0.0,   7.0,  "i_I baseline input to I"),
+    ("exc_ext",            0.0,   0.0,   2.0,  "i_E time-dep input to E"),
+    ("inh_ext",            0.0,   0.0,   7.0,  "i_I time-dep input to I"),
+]
+
+PARAM_NAMES    = [p[0] for p in PARAMS]
+PARAM_DEFAULTS = {p[0]: p[1] for p in PARAMS}
+PARAM_LOWS     = np.array([p[2] for p in PARAMS])
+PARAM_HIGHS    = np.array([p[3] for p in PARAMS])
+PARAM_DESCS    = {p[0]: p[4] for p in PARAMS}
+STAT_NAMES     = ['exc_mean', 'exc_std', 'exc_psd_slope']
+n_params       = len(PARAMS)
+n_jobs         = min(multiprocessing.cpu_count(), 32)
+
+# ── single WC simulation → output statistics ──────────────────────────────────
+def run_wc(param_dict):
+    """
+    Run WCModel with given parameters (others at defaults).
+    Returns dict of output statistics, or None for degenerate output.
+    """
+    model = WCModel()
+    model.params['duration'] = DURATION_MS
+    model.params['dt']       = DT_MS
+    for k, v in PARAM_DEFAULTS.items():
+        model.params[k] = v
+    for k, v in param_dict.items():
+        model.params[k] = v
+    model.run()
+
+    exc = model.outputs['exc'][0]
+    if np.isnan(exc).any() or exc.std() < 1e-8:
+        return None
+
+    n_discard = int(TRANSIENT_MS / DT_MS)
+    exc_trim  = exc[n_discard:]
+    if len(exc_trim) < 100:
+        return None
+
+    fs = 1000.0 / DT_MS
+    freqs, psd = scipy.signal.periodogram(exc_trim, fs=fs)
+    freqs = freqs[1:]; psd = psd[1:]
+    slope = 0.0
+    if len(freqs) > 3 and np.all(psd > 0):
+        slope, _ = np.polyfit(np.log10(freqs), np.log10(psd), 1)
+
+    return {
+        'exc_mean':      float(exc_trim.mean()),
+        'exc_std':       float(exc_trim.std()),
+        'exc_psd_slope': float(slope),
+    }
+
+def row_to_dict(row):
+    return {PARAM_NAMES[i]: row[i] for i in range(n_params)}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. ONE-AT-A-TIME (OAT)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("=" * 65)
+print(f"1. OAT SCAN  ({N_GRID} × {n_params} = {N_GRID*n_params} simulations)")
+print("=" * 65)
+
+oat_results = {}
+for pname, default, lo, hi, desc in PARAMS:
+    grid  = np.linspace(lo, hi, N_GRID)
+    dicts = [{pname: v} for v in grid]
+    outs  = Parallel(n_jobs=n_jobs, backend='loky')(
+        delayed(run_wc)(d) for d in dicts
+    )
+    valid_grid  = [grid[i] for i, s in enumerate(outs) if s is not None]
+    valid_stats = [s for s in outs if s is not None]
+    n_fail      = N_GRID - len(valid_stats)
+    if n_fail:
+        print(f"  {pname}: {n_fail}/{N_GRID} degenerate")
+
+    per_stat = {s: np.array([o[s] for o in valid_stats]) for s in STAT_NAMES}
+    cv = {s: vals.std() / (abs(vals.mean()) + 1e-10)
+          for s, vals in per_stat.items()
+          if len(vals) > 1}
+    agg_cv = float(np.mean(list(cv.values()))) if cv else 0.0
+
+    oat_results[pname] = {
+        'grid': valid_grid, 'stats': per_stat,
+        'cv': cv, 'aggregate_cv': agg_cv,
+    }
+    print(f"  {pname:<22s} CV={agg_cv:.4f}  ({desc})")
+
+oat_ranked = sorted(oat_results.items(),
+                    key=lambda x: x[1]['aggregate_cv'], reverse=True)
+print("\nOAT RANKING:")
+for rank, (name, res) in enumerate(oat_ranked, 1):
+    print(f"  {rank:2d}. {name:<22s} {res['aggregate_cv']:.4f}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. SOBOL INDICES
+# ═══════════════════════════════════════════════════════════════════════════════
+sobol_results   = None
+sobol_param_mat = None
+sobol_raw_stats = None
+
+if SALIB_AVAILABLE:
+    n_sobol_total = N_SOBOL * (2 * n_params + 2)
+    print("\n" + "=" * 65)
+    print(f"2. SOBOL INDICES  ({N_SOBOL} × (2×{n_params}+2) = "
+          f"{n_sobol_total} simulations)")
+    print("=" * 65)
+
+    problem = {
+        'num_vars': n_params,
+        'names':    PARAM_NAMES,
+        'bounds':   list(zip(PARAM_LOWS, PARAM_HIGHS)),
+    }
+    sobol_param_mat = saltelli.sample(problem, N_SOBOL, calc_second_order=False)
+
+    print(f"  Running {n_sobol_total} simulations in parallel "
+          f"({n_jobs} cores)...")
+    raw = Parallel(n_jobs=n_jobs, backend='loky', verbose=3)(
+        delayed(run_wc)(row_to_dict(row)) for row in sobol_param_mat
+    )
+    sobol_raw_stats = raw   # keep for GP active subspace
+
+    sobol_results = {}
+    for sname in STAT_NAMES:
+        Y = np.array([s[sname] if s is not None else np.nan for s in raw])
+        nan_mask = np.isnan(Y)
+        if nan_mask.any():
+            Y[nan_mask] = np.nanmean(Y)
+        Si = sobol_analyze.analyze(problem, Y,
+                                   calc_second_order=False,
+                                   print_to_console=False)
+        sobol_results[sname] = Si
+
+    # print table
+    print(f"\n  {'Parameter':<22}", end="")
+    for sname in STAT_NAMES:
+        print(f"  S1_{sname[:8]:<8} ST_{sname[:8]:<8}", end="")
+    print()
+    print("  " + "-" * (22 + 20 * len(STAT_NAMES)))
+    for i, name in enumerate(PARAM_NAMES):
+        print(f"  {name:<22}", end="")
+        for sname in STAT_NAMES:
+            Si = sobol_results[sname]
+            print(f"  {Si['S1'][i]:>8.4f}   {Si['ST'][i]:>8.4f} ", end="")
+        print()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. GP ACTIVE SUBSPACE (no SBI posterior, no BOLD, uses Sobol samples)
+# ═══════════════════════════════════════════════════════════════════════════════
+gp_active_subspace = None
+
+if GP_AVAILABLE and sobol_param_mat is not None and sobol_raw_stats is not None:
+    print("\n" + "=" * 65)
+    print("3. GP-BASED ACTIVE SUBSPACE")
+    print("   (Gaussian process surrogate over Sobol samples → gradient")
+    print("    covariance matrix → eigenvalues, eigenvectors, activity scores)")
+    print("=" * 65)
+
+    # use exc_std as the primary output for active subspace
+    # (most informative for resting-state dynamics)
+    TARGET_STAT = 'exc_std'
+
+    X_raw = sobol_param_mat
+    Y_raw = np.array([
+        s[TARGET_STAT] if s is not None else np.nan
+        for s in sobol_raw_stats
+    ])
+    valid  = ~np.isnan(Y_raw)
+    X_fit  = X_raw[valid]
+    Y_fit  = Y_raw[valid]
+
+    # normalize inputs to [0,1] for GP stability
+    X_norm = (X_fit - PARAM_LOWS) / (PARAM_HIGHS - PARAM_LOWS + 1e-10)
+    scaler = StandardScaler()
+    Y_scaled = scaler.fit_transform(Y_fit.reshape(-1, 1)).ravel()
+
+    print(f"  Fitting GP on {len(X_fit)} valid samples "
+          f"(target: {TARGET_STAT}) ...")
+    kernel = RBF(length_scale=np.ones(n_params)) + WhiteKernel(noise_level=0.01)
+    gp     = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3,
+                                      normalize_y=True)
+    gp.fit(X_norm, Y_scaled)
+    print(f"  GP fitted. Kernel: {gp.kernel_}")
+
+    # estimate gradient covariance C = E[∇f ∇f^T] via finite differences
+    # on a fine grid of N_GRAD random points
+    N_GRAD = min(500, len(X_fit))
+    rng    = np.random.default_rng(42)
+    X_grad = rng.uniform(0, 1, size=(N_GRAD, n_params))
+    eps    = 1e-4
+
+    grads = np.zeros((N_GRAD, n_params))
+    for j in range(n_params):
+        X_plus  = X_grad.copy(); X_plus[:, j]  += eps
+        X_minus = X_grad.copy(); X_minus[:, j] -= eps
+        f_plus  = gp.predict(X_plus)
+        f_minus = gp.predict(X_minus)
+        grads[:, j] = (f_plus - f_minus) / (2 * eps)
+
+    # gradient covariance matrix C ∈ R^(p×p)
+    C      = (grads.T @ grads) / N_GRAD
+    e_vals, e_vecs = np.linalg.eigh(C)
+
+    # sort descending
+    idx    = np.argsort(e_vals)[::-1]
+    e_vals = e_vals[idx]
+    e_vecs = e_vecs[:, idx]
+
+    # activity scores: α_i = Σ_j λ_j * w_ij²
+    activity_scores = np.array([
+        sum(e_vals[j] * e_vecs[i, j]**2 for j in range(n_params))
+        for i in range(n_params)
+    ])
+
+    gp_active_subspace = {
+        'e_vals': e_vals,
+        'e_vecs': e_vecs,
+        'activity_scores': activity_scores,
+    }
+
+    # rank by activity score
+    as_ranked = sorted(
+        zip(PARAM_NAMES, activity_scores),
+        key=lambda x: x[1], reverse=True
+    )
+
+    print(f"\n  Eigenvalues: {e_vals.round(6).tolist()}")
+    print(f"\n  Eigenvectors (columns = directions, rows = parameters):")
+    print(f"  {'Parameter':<22}", end="")
+    for j in range(n_params):
+        print(f"  v{j+1:<5}", end="")
+    print()
+    for i, name in enumerate(PARAM_NAMES):
+        print(f"  {name:<22}", end="")
+        for j in range(n_params):
+            print(f"  {e_vecs[i,j]:>6.3f}", end="")
+        print()
+
+    print(f"\n  Activity scores (sensitivity via GP active subspace):")
+    for rank, (name, score) in enumerate(as_ranked, 1):
+        print(f"  {rank:2d}. {name:<22s} {score:.6e}  ({PARAM_DESCS[name]})")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLOTS
+# ═══════════════════════════════════════════════════════════════════════════════
+n_methods = sum([1,
+                 1 if sobol_results is not None else 0,
+                 1 if gp_active_subspace is not None else 0])
+
+fig_rows = 1 + len(STAT_NAMES)
+fig_cols = n_methods
+fig, axes = plt.subplots(fig_rows, fig_cols,
+                         figsize=(6 * fig_cols, 4 * fig_rows))
+if fig_cols == 1:
+    axes = axes.reshape(-1, 1)
+
+fig.suptitle("WCModel Parameter Sensitivity Analysis\n(excitatory output only)",
+             fontsize=13, fontweight='bold')
+
+col = 0
+
+# ── OAT aggregate ranking ─────────────────────────────────────────────────────
+ax = axes[0, col]
+names_r = [n for n, _ in oat_ranked]
+cvs_r   = [r['aggregate_cv'] for _, r in oat_ranked]
+descs_r = [PARAM_DESCS[n] for n in names_r]
+colors  = plt.cm.RdYlGn_r(np.linspace(0.1, 0.9, len(names_r)))
+bars    = ax.bar(range(len(names_r)), cvs_r, color=colors, edgecolor='white')
+ax.set_xticks(range(len(names_r)))
+ax.set_xticklabels(descs_r, rotation=45, ha='right', fontsize=7)
+ax.set_ylabel("Aggregate CV", fontsize=9)
+ax.set_title("OAT: Sensitivity Ranking", fontsize=10)
+ax.grid(axis='y', alpha=0.3)
+for bar, cv in zip(bars, cvs_r):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+            f"{cv:.3f}", ha='center', va='bottom', fontsize=6)
+
+# OAT per-stat traces
+cmap = plt.cm.tab10
+for row, sname in enumerate(STAT_NAMES, start=1):
+    ax = axes[row, col]
+    for idx, (pname, res) in enumerate(oat_ranked):
+        gv   = res['grid']
+        vals = res['stats'][sname]
+        if len(gv) < 2:
+            continue
+        lo_p = PARAM_LOWS[PARAM_NAMES.index(pname)]
+        hi_p = PARAM_HIGHS[PARAM_NAMES.index(pname)]
+        gv_n = (np.array(gv) - lo_p) / (hi_p - lo_p + 1e-10)
+        ax.plot(gv_n, vals, color=cmap(idx / n_params),
+                marker='o', markersize=2, linewidth=1.0,
+                label=PARAM_DESCS[pname])
+    ax.set_xlabel("Normalized param [0=min, 1=max]", fontsize=8)
+    ax.set_ylabel(sname, fontsize=8)
+    ax.set_title(f"OAT: {sname}", fontsize=9)
+    ax.legend(fontsize=5, ncol=2, loc='best')
+    ax.grid(alpha=0.3)
+
+col += 1
+
+# ── Sobol plots ───────────────────────────────────────────────────────────────
+if sobol_results is not None:
+    # aggregate ST ranking
+    ST_agg = np.zeros(n_params)
+    for sname in STAT_NAMES:
+        ST_agg += sobol_results[sname]['ST']
+    ST_agg /= len(STAT_NAMES)
+    so_order = np.argsort(ST_agg)[::-1]
+
+    ax = axes[0, col]
+    ax.bar(range(n_params),
+           ST_agg[so_order],
+           color=plt.cm.RdYlGn_r(np.linspace(0.1, 0.9, n_params)),
+           edgecolor='white')
+    ax.set_xticks(range(n_params))
+    ax.set_xticklabels([PARAM_DESCS[PARAM_NAMES[i]] for i in so_order],
+                       rotation=45, ha='right', fontsize=7)
+    ax.set_ylabel("ST (avg over stats)", fontsize=9)
+    ax.set_title("Sobol Total-Order Ranking", fontsize=10)
+    ax.grid(axis='y', alpha=0.3); ax.set_ylim(0, 1)
+
+    for row, sname in enumerate(STAT_NAMES, start=1):
+        ax  = axes[row, col]
+        Si  = sobol_results[sname]
+        x   = np.arange(n_params)
+        w   = 0.35
+        ax.bar(x - w/2, Si['S1'], w, label='S1', color='steelblue', alpha=0.8)
+        ax.bar(x + w/2, Si['ST'], w, label='ST', color='darkorange', alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([PARAM_DESCS[n] for n in PARAM_NAMES],
+                           rotation=45, ha='right', fontsize=6)
+        ax.set_ylabel("Sobol index", fontsize=8)
+        ax.set_title(f"Sobol: {sname}", fontsize=9)
+        ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3); ax.set_ylim(0, 1)
+    col += 1
+
+# ── GP active subspace plots ──────────────────────────────────────────────────
+if gp_active_subspace is not None:
+    act_scores = gp_active_subspace['activity_scores']
+    e_vecs     = gp_active_subspace['e_vecs']
+    as_order   = np.argsort(act_scores)[::-1]
+
+    ax = axes[0, col]
+    ax.bar(range(n_params),
+           act_scores[as_order],
+           color=plt.cm.RdYlGn_r(np.linspace(0.1, 0.9, n_params)),
+           edgecolor='white')
+    ax.set_xticks(range(n_params))
+    ax.set_xticklabels([PARAM_DESCS[PARAM_NAMES[i]] for i in as_order],
+                       rotation=45, ha='right', fontsize=7)
+    ax.set_ylabel("Activity score", fontsize=9)
+    ax.set_title("GP Active Subspace:\nActivity Scores", fontsize=10)
+    ax.grid(axis='y', alpha=0.3)
+
+    # eigenvector heatmaps for top 3 eigenvectors
+    for row, j in enumerate(range(min(3, n_params)), start=1):
+        ax = axes[row, col]
+        ev = e_vecs[:, j] ** 2   # squared components
+        ax.barh(range(n_params), ev[np.argsort(ev)],
+                color=plt.cm.viridis(np.linspace(0.2, 0.9, n_params)))
+        ax.set_yticks(range(n_params))
+        ax.set_yticklabels(
+            [PARAM_DESCS[PARAM_NAMES[i]] for i in np.argsort(ev)],
+            fontsize=6)
+        ax.set_xlabel("w²_ij (squared component)", fontsize=8)
+        ax.set_title(f"Eigenvector {j+1}  "
+                     f"(λ={gp_active_subspace['e_vals'][j]:.4f})", fontsize=9)
+        ax.grid(axis='x', alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(PLOT_PATH, dpi=150, bbox_inches='tight')
+print(f"\nSaved plot → {PLOT_PATH}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY TABLE
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("FINAL SUMMARY — COMBINED PARAMETER SENSITIVITY RANKING")
+print("=" * 65)
+
+# build combined score: average rank across available methods
+from collections import defaultdict
+rank_sums  = defaultdict(float)
+rank_count = defaultdict(int)
+
+for rank, (name, _) in enumerate(oat_ranked, 1):
+    rank_sums[name]  += rank
+    rank_count[name] += 1
+
+if sobol_results is not None:
+    ST_agg = np.zeros(n_params)
+    for sname in STAT_NAMES:
+        ST_agg += sobol_results[sname]['ST']
+    sobol_order = np.argsort(ST_agg)[::-1]
+    for rank, idx in enumerate(sobol_order, 1):
+        name = PARAM_NAMES[idx]
+        rank_sums[name]  += rank
+        rank_count[name] += 1
+
+if gp_active_subspace is not None:
+    as_order = np.argsort(gp_active_subspace['activity_scores'])[::-1]
+    for rank, idx in enumerate(as_order, 1):
+        name = PARAM_NAMES[idx]
+        rank_sums[name]  += rank
+        rank_count[name] += 1
+
+avg_ranks = {name: rank_sums[name] / rank_count[name]
+             for name in PARAM_NAMES}
+final_ranked = sorted(avg_ranks.items(), key=lambda x: x[1])
+
+print(f"  {'Rank':<5} {'Parameter':<22} {'Desc':<30} {'Avg rank score'}")
+print("  " + "-" * 70)
+for rank, (name, avg_rank) in enumerate(final_ranked, 1):
+    print(f"  {rank:<5} {name:<22} {PARAM_DESCS[name]:<30} {avg_rank:.2f}")
