@@ -103,7 +103,7 @@ for i in range(batch_size):
             + (P.epsilon * P.r0 * P.Eo * P.TE) * (1.0 - q[0, 0] / v[0, 0])
             + (1.0 - P.epsilon)  * (1.0 - v[0, 0])
             )
-            bold_val+= np.abs(bold_noise[i])
+            bold_val+= (bold_noise[i])
             bold_out.append(bold_val)
 
     bold = np.array(bold_out)
