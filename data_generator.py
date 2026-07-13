@@ -62,7 +62,7 @@ outputs_exc  = []
 outputs_bold = []
 
 bold_noise_variance = 0.00048
-bold_noise = rng.normal(0,  bold_noise_variance,  1250)
+
 
 
 for i in range(batch_size):
@@ -103,7 +103,7 @@ for i in range(batch_size):
             + (P.epsilon * P.r0 * P.Eo * P.TE) * (1.0 - q[0, 0] / v[0, 0])
             + (1.0 - P.epsilon)  * (1.0 - v[0, 0])
             )
-            bold_val+= (bold_noise[j])
+            bold_val += rng.normal(0, bold_noise_variance)
             bold_out.append(bold_val)
 
     bold = np.array(bold_out)
