@@ -3,29 +3,6 @@ wc_calibration.py
 ─────────────────
 Parallel Bayesian calibration of neurolib WCModel + VBI ParBold simulator.
 Updated with soft baseline penalties to resolve flatline optimization constraints.
-
-Parameter selection (updated):
-The 6 calibrated parameters are now the top-6 most sensitive parameters from
-the OAT sensitivity run (wc_sensitivity_bounded.py), ranked by aggregate CV:
-  1. mu_inh    (0.9059)  θ_I inh threshold
-  2. c_excexc  (0.5860)  W_EE (E→E coupling)
-  3. exc_ext   (0.5514)  i_E time-dep input to E
-  4. mu_exc    (0.4736)  θ_E exc threshold
-  5. a_exc     (0.3590)  m_E exc sigmoid gain
-  6. a_inh     (0.1309)  m_I inh sigmoid gain
-
-Bounds for each are the STAGE 0 narrowed (physiologically-plausible) bounds
-from that same run, not hand-picked ranges:
-  c_excexc : [10.0000, 40.0000]
-  exc_ext  : [ 0.0000,  4.0000]
-  a_inh    : [ 1.4276,  3.0000]
-  a_exc    : [ 0.0000,  1.4741]
-  mu_exc   : [ 0.0000,  2.9483]
-  mu_inh   : [ 2.8552,  6.0000]
-
-tau_exc and inh_ext_baseline were dropped from the calibrated set (they
-ranked 7th and 14th) and are now held fixed at their neurolib defaults in
-every simulation rather than being optimized over.
 """
 
 import numpy as np
@@ -67,11 +44,6 @@ SAVE_MIN      = 15     # keep last 15 min, discard first 3 as transient
 K_SIMS        = 500    # simulations per spectral_loss call
 N_BO_TRIALS   = 50     # Bayesian optimization budget
 
-# parameters held fixed (not calibrated) at their neurolib defaults, since
-# they ranked outside the top 6 in the sensitivity analysis
-FIXED_TAU_EXC          = 2.5   # ms, neurolib default
-FIXED_INH_EXT_BASELINE = 0.0   # neurolib default
-
 # ── load and preprocess HCP data ──────────────────────────────────────────────
 print("Loading HCP data ...")
 y_obs = torch.from_numpy(np.loadtxt("/work/sm222/103818_1_LR.R.1D")).float()
@@ -91,21 +63,18 @@ P_obs_mean = torch.from_numpy(psd_obs).float().mean(dim=0)
 
 # ── single WC + VBI BOLD simulation ──────────────────────────────────────────
 def run_wc_bold(params_tuple):
-    # Top-6 sensitive parameters (see module docstring for ranking + bounds)
-    exc_ext, mu_inh, a_inh, c_excexc, a_exc, mu_exc, seed, *_extra = params_tuple
+    # Catch the 6 parameters and bundle any extra items into `_extra`
+    exc_ext, tau_exc, a_inh, inh_ext_baseline, a_exc, mu_exc, seed, *_extra = params_tuple
     np.random.seed(seed)
     model = WCModel()
-    model.params['sigma_ou']           = .01
-    model.params['duration']           = DURATION_MIN * 60 * 1000   # ms
-    model.params['exc_ext']            = exc_ext
-    model.params['mu_inh']             = mu_inh
-    model.params['a_inh']              = a_inh
-    model.params['c_excexc']           = c_excexc
-    model.params['a_exc']              = a_exc
-    model.params['mu_exc']             = mu_exc
-    # held fixed — not part of the calibrated top-6
-    model.params['tau_exc']            = FIXED_TAU_EXC
-    model.params['inh_ext_baseline']   = FIXED_INH_EXT_BASELINE
+    model.params['sigma_ou'] = .01
+    model.params['duration']         = DURATION_MIN * 60 * 1000   # ms
+    model.params['exc_ext']          = exc_ext
+    model.params['tau_exc']           = tau_exc
+    model.params['a_inh']            = a_inh
+    model.params['inh_ext_baseline'] = inh_ext_baseline  
+    model.params['a_exc']            = a_exc
+    model.params['mu_exc']           = mu_exc
     model.run()
 
     exc = model.outputs['exc'][0]
@@ -147,17 +116,17 @@ def run_wc_bold(params_tuple):
 
 # ── spectral loss (Parallelized with Soft Penalties) ─────────────────────────
 def spectral_loss(gamma):
-    exc_ext  = gamma["exc_ext"]
-    mu_inh   = gamma["mu_inh"]
-    a_inh    = gamma["a_inh"]
-    c_excexc = gamma["c_excexc"]
-    a_exc    = gamma["a_exc"]
-    mu_exc   = gamma["mu_exc"]
-
+    exc_ext = gamma["exc_ext"]
+    tau_exc   = gamma["tau_exc"]
+    a_inh = gamma["a_inh"]
+    inh_ext_baseline = gamma["inh_ext_baseline"]
+    a_exc = gamma["a_exc"]
+    mu_exc = gamma["mu_exc"]
+    
     seed_seq = np.random.SeedSequence()
     child_seeds = [s.generate_state(1)[0] for s in seed_seq.spawn(K_SIMS)]
 
-    task_params = [(exc_ext, mu_inh, a_inh, c_excexc, a_exc, mu_exc, child_seeds[i])
+    task_params = [(exc_ext, tau_exc, a_inh, inh_ext_baseline, a_exc, mu_exc, child_seeds[i])
                    for i in range(K_SIMS)]
 
     num_workers = min(cpu_count(), 64)
@@ -192,8 +161,8 @@ def spectral_loss(gamma):
     n_freq = min(P_obs_mean.shape[0], P_sim_mean.shape[0])
     loss   = torch.sum(torch.abs(P_obs_mean[:n_freq] - P_sim_mean[:n_freq])).item()
 
-    print(f"  exc_ext={exc_ext:.3f}, mu_inh={mu_inh:.3f}, a_inh={a_inh:.3f}, "
-          f"c_excexc={c_excexc:.3f}, a_exc={a_exc:.3f}, "
+    print(f"  exc_ext={exc_ext:.3f}, tau_exc={tau_exc:.3f}, a_inh={a_inh:.3f}, "
+          f"inh_ext_baseline={inh_ext_baseline:.3f}, a_exc={a_exc:.3f}, "
           f"mu_exc={mu_exc:.3f} → loss={loss:.4f} ({n_failed} failed)")
 
     return {"loss": (loss, 0.0)}
@@ -203,16 +172,15 @@ if __name__ == '__main__':
     print(f"\nStarting Parallel Bayesian optimization ({N_BO_TRIALS} trials, "
           f"{K_SIMS} sims per trial) ...\n")
 
-    # Bounds = STAGE 0 narrowed (physiologically-plausible) bounds from the
-    # sensitivity run, for the top-6 most sensitive parameters.
+    # FIX: Tightened ranges closer to stable Wilson-Cowan oscillatory regimes
     result = optimize(
         parameters=[
-            {"name": "exc_ext",  "type": "range", "bounds": [0.0,    4.0]},
-            {"name": "mu_inh",   "type": "range", "bounds": [2.8552, 6.0]},
-            {"name": "a_inh",    "type": "range", "bounds": [1.4276, 3.0]},
-            {"name": "c_excexc", "type": "range", "bounds": [10.0,   40.0]},
-            {"name": "a_exc",    "type": "range", "bounds": [0.0,    1.4741]},
-            {"name": "mu_exc",   "type": "range", "bounds": [0.0,    2.9483]},
+            {"name": "exc_ext", "type": "range", "bounds": [0.4, 1.6]},
+            {"name": "tau_exc", "type": "range", "bounds": [1.0, 7.5]},
+            {"name": "a_inh", "type": "range", "bounds": [.5, 3.0]}, 
+            {"name": "inh_ext_baseline", "type": "range", "bounds": [1.0, 5.0]},
+            {"name": "a_exc", "type": "range", "bounds": [.5, 3.0]},
+            {"name": "mu_exc", "type": "range", "bounds": [1.0, 4.0]},
         ],
         evaluation_function=spectral_loss,
         objective_name="loss",
@@ -242,8 +210,8 @@ if __name__ == '__main__':
     val_seed_seq = np.random.SeedSequence()
     val_child_seeds = [s.generate_state(1)[0] for s in val_seed_seq.spawn(N_VAL)]
 
-    val_params = [(gamma_hat["exc_ext"], gamma_hat["mu_inh"], gamma_hat["a_inh"],
-                   gamma_hat["c_excexc"], gamma_hat["a_exc"], gamma_hat["mu_exc"],
+    val_params = [(gamma_hat["exc_ext"], gamma_hat["tau_exc"], gamma_hat["a_inh"],
+                   gamma_hat["inh_ext_baseline"], gamma_hat["a_exc"], gamma_hat["mu_exc"],
                    val_child_seeds[i]) for i in range(N_VAL)]
 
     with Pool(processes=min(cpu_count(), 64)) as pool:
@@ -293,9 +261,9 @@ if __name__ == '__main__':
         ax.legend(fontsize=9); ax.grid(alpha=0.3)
         ax.text(0.02, 0.02,
             f"exc_ext={gamma_hat['exc_ext']:.3f}\n"
-            f"mu_inh={gamma_hat['mu_inh']:.3f}\n"
+            f"tau_exc={gamma_hat['tau_exc']:.3f}\n"
             f"a_inh={gamma_hat['a_inh']:.3f}\n"
-            f"c_excexc={gamma_hat['c_excexc']:.3f}\n"
+            f"inh_ext_baseline={gamma_hat['inh_ext_baseline']:.3f}\n"
             f"a_exc={gamma_hat['a_exc']:.3f}\n"
             f"mu_exc={gamma_hat['mu_exc']:.3f}",
             transform=ax.transAxes, fontsize=9, verticalalignment='bottom',
